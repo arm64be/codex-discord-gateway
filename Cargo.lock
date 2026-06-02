@@ -176,7 +176,7 @@ dependencies = [
 [[package]]
 name = "codex-gateway-core"
 version = "0.1.0"
-source = "git+https://github.com/arm64be/codex-gateway-core.git#e1c9dde5462c9e0aadebee73348724e0581876b8"
+source = "git+https://github.com/arm64be/codex-gateway-core.git#2e7f2970a934fed164cf4f11d542ce6ec9f37cc1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -286,7 +286,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -795,7 +795,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1357,7 +1357,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

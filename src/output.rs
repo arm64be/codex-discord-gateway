@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use codex_gateway_core::{BoxFuture, TurnOutput};
@@ -5,16 +6,28 @@ use serenity::all::{
     ChannelId, CommandInteraction, Context, CreateInteractionResponse,
     CreateInteractionResponseMessage, CreateMessage,
 };
-use serenity::http::Http;
+use serenity::http::{Http, Typing};
+use tokio::sync::Mutex;
 
 const DISCORD_LIMIT: usize = 1900;
 
 #[derive(Debug)]
 pub(crate) struct DiscordOutput {
     http: Arc<Http>,
+    typing: Mutex<HashMap<ChannelId, Typing>>,
 }
 
 impl TurnOutput<ChannelId> for DiscordOutput {
+    fn assistant_message_started<'a>(
+        &'a self,
+        channel_id: &'a ChannelId,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.start_typing(*channel_id).await;
+            Ok(())
+        })
+    }
+
     fn send<'a>(
         &'a self,
         channel_id: &'a ChannelId,
@@ -29,12 +42,48 @@ impl TurnOutput<ChannelId> for DiscordOutput {
             Ok(())
         })
     }
+
+    fn assistant_message_finished<'a>(
+        &'a self,
+        channel_id: &'a ChannelId,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.stop_typing(channel_id).await;
+            Ok(())
+        })
+    }
+
+    fn send_error<'a>(&'a self, key: &'a ChannelId, error: &'a anyhow::Error) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let _ = self.assistant_message_started(key).await;
+            let _ = self
+                .send(key, &format!("Codex turn failed: {error:#}"))
+                .await;
+            let _ = self.assistant_message_finished(key).await;
+        })
+    }
 }
 
 pub(crate) fn output(ctx: &Context) -> Arc<DiscordOutput> {
     Arc::new(DiscordOutput {
         http: Arc::clone(&ctx.http),
+        typing: Mutex::new(HashMap::new()),
     })
+}
+
+impl DiscordOutput {
+    async fn start_typing(&self, channel_id: ChannelId) {
+        let mut typing = self.typing.lock().await;
+        typing
+            .entry(channel_id)
+            .or_insert_with(|| channel_id.start_typing(&self.http));
+    }
+
+    async fn stop_typing(&self, channel_id: &ChannelId) {
+        if let Some(typing) = self.typing.lock().await.remove(channel_id) {
+            typing.stop();
+        }
+    }
 }
 
 pub(crate) async fn respond_ephemeral(
