@@ -68,14 +68,17 @@ The bot registers one global slash command, `/codex`, on startup.
 - `/codex steer message:<text>` steers the active turn with `turn/steer`; if idle, it queues a turn.
 - `/codex queue` shows active and queued turns.
 - `/codex model [name]` shows or changes the model for future turns.
-- `/codex effort [level]` shows or changes reasoning effort. Use `default`, `minimal`, `low`, `medium`, or `high`.
+- `/codex effort [level]` shows or changes reasoning effort. Use `default`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
 - `/codex models` lists available Codex models.
 - `/codex status` shows thread, model, effort, and rate-limit reset data.
 - `/codex goal [objective] [token_budget]` shows or sets the thread goal.
 - `/codex pause` pauses the current goal.
-- `/codex resume` resumes the current goal.
+- `/codex resume [thread_id]` resumes a Codex session by thread id, or resumes the current goal when omitted.
 - `/codex goal-clear` clears the current goal.
-- `/codex session action:<show|new|list|switch> [thread_id]` manages Codex threads.
+- `/codex session` shows the current Codex session.
+- `/codex new` starts a new Codex session.
+- `/codex clear` clears the current Codex session by starting a new one.
+- `/codex sessions` lists Codex sessions.
 - `/codex interrupt` interrupts the active turn.
 
 ## Behavior

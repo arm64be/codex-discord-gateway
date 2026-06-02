@@ -60,7 +60,7 @@ pub(crate) fn commands() -> Vec<CreateCommand> {
                 .add_sub_option(CreateCommandOption::new(
                     CommandOptionType::String,
                     "level",
-                    "minimal, low, medium, high",
+                    "minimal, low, medium, high, xhigh",
                 )),
             )
             .add_option(CreateCommandOption::new(
@@ -95,33 +95,43 @@ pub(crate) fn commands() -> Vec<CreateCommand> {
                 "pause",
                 "Pause the current goal",
             ))
-            .add_option(CreateCommandOption::new(
-                CommandOptionType::SubCommand,
-                "resume",
-                "Resume the current goal",
-            ))
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "resume",
+                    "Resume a session by thread id, or resume the current goal",
+                )
+                .add_sub_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "thread_id",
+                    "Thread id to resume",
+                )),
+            )
             .add_option(CreateCommandOption::new(
                 CommandOptionType::SubCommand,
                 "goal-clear",
                 "Clear the current goal",
             ))
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "session",
-                    "Show, new, list, or switch sessions",
-                )
-                .add_sub_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "action",
-                    "show, new, list, switch",
-                ))
-                .add_sub_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "thread_id",
-                    "Thread id for switch",
-                )),
-            )
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "session",
+                "Show current session",
+            ))
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "new",
+                "Start a new Codex session",
+            ))
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "clear",
+                "Clear the current Codex session",
+            ))
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "sessions",
+                "List Codex sessions",
+            ))
             .add_option(CreateCommandOption::new(
                 CommandOptionType::SubCommand,
                 "interrupt",
@@ -198,23 +208,35 @@ pub(crate) async fn handle_codex_command(
             .await?;
         }
         "resume" => {
-            respond_ephemeral(
-                ctx,
-                command,
+            let content = if let Some(thread_id) = sub_string_opt(command, "thread_id") {
+                gateway
+                    .session(channel_id, SessionAction::Switch, Some(thread_id))
+                    .await?
+            } else {
                 gateway
                     .set_goal_status(channel_id, GoalStatus::Active)
-                    .await?,
-            )
-            .await?;
+                    .await?
+            };
+            respond_ephemeral(ctx, command, content).await?;
         }
         "goal-clear" => {
             respond_ephemeral(ctx, command, gateway.clear_goal(channel_id).await?).await?;
         }
         "session" => {
-            let action = sub_string_opt(command, "action").unwrap_or_else(|| "show".into());
-            let thread_id = sub_string_opt(command, "thread_id");
             let content = gateway
-                .session(channel_id, parse_session_action(&action)?, thread_id)
+                .session(channel_id, SessionAction::Show, None)
+                .await?;
+            respond_ephemeral(ctx, command, content).await?;
+        }
+        "new" | "clear" => {
+            let content = gateway
+                .session(channel_id, SessionAction::New, None)
+                .await?;
+            respond_ephemeral(ctx, command, content).await?;
+        }
+        "sessions" => {
+            let content = gateway
+                .session(channel_id, SessionAction::List, None)
                 .await?;
             respond_ephemeral(ctx, command, content).await?;
         }
@@ -261,18 +283,9 @@ fn parse_effort(value: &str) -> anyhow::Result<Option<ReasoningEffort>> {
         "low" => Ok(Some(ReasoningEffort::Low)),
         "medium" => Ok(Some(ReasoningEffort::Medium)),
         "high" => Ok(Some(ReasoningEffort::High)),
+        "xhigh" => Ok(Some(ReasoningEffort::XHigh)),
         other => Err(anyhow!(
-            "unknown effort `{other}`; use default, minimal, low, medium, or high"
+            "unknown effort `{other}`; use default, minimal, low, medium, high, or xhigh"
         )),
-    }
-}
-
-fn parse_session_action(value: &str) -> anyhow::Result<SessionAction> {
-    match value.to_ascii_lowercase().as_str() {
-        "show" => Ok(SessionAction::Show),
-        "new" => Ok(SessionAction::New),
-        "list" => Ok(SessionAction::List),
-        "switch" => Ok(SessionAction::Switch),
-        other => Err(anyhow!("unknown session action `{other}`")),
     }
 }
