@@ -1,18 +1,9 @@
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::{Context as _, anyhow};
-use chrono::{DateTime, Utc};
-use codex_app_server::{AppClientInfo, AppServer, AppServerConfig, ThreadHandle};
-use codex_app_server_protocol::{
-    ClientRequest, GetAccountRateLimitsResponse, ModelListParams, ModelListResponse,
-    ReasoningEffort, RequestId, ServerNotification, ThreadGoalClearParams, ThreadGoalClearResponse,
-    ThreadGoalGetParams, ThreadGoalGetResponse, ThreadGoalSetParams, ThreadGoalSetResponse,
-    ThreadGoalStatus, ThreadListParams, ThreadListResponse, ThreadResumeParams,
-    ThreadResumeResponse, ThreadStartParams, TurnInterruptParams, TurnInterruptResponse,
-    TurnStartParams, TurnStartResponse, TurnSteerParams, TurnSteerResponse, UserInput,
+use codex_gateway_core::{
+    BoxFuture, CodexGateway, GatewayConfig, GoalStatus, ReasoningEffort, SessionAction, TurnOutput,
 };
 use serde::Deserialize;
 use serenity::all::{
@@ -21,7 +12,7 @@ use serenity::all::{
     CreateMessage, EventHandler, GatewayIntents, Interaction, Message, Ready,
 };
 use serenity::async_trait;
-use tokio::sync::{Mutex, mpsc};
+use serenity::http::Http;
 use tracing::{error, info};
 
 const DISCORD_LIMIT: usize = 1900;
@@ -120,8 +111,16 @@ async fn main() -> anyhow::Result<()> {
     let default_cwd = env::var("CODEX_CWD").ok().or(config.cwd.clone());
     let inherit_stderr = env::var("CODEX_INHERIT_STDERR").is_ok() || config.inherit_stderr;
 
-    let gateway =
-        CodexGateway::spawn(codex_bin, default_model, default_cwd, inherit_stderr).await?;
+    let mut gateway_config = GatewayConfig::new(default_model);
+    gateway_config.codex_bin = codex_bin;
+    gateway_config.default_cwd = default_cwd;
+    gateway_config.inherit_stderr = inherit_stderr;
+    gateway_config.client_name = "codex_discord_gateway".into();
+    gateway_config.client_title = Some("Codex Discord Gateway".into());
+    gateway_config.client_version = env!("CARGO_PKG_VERSION").into();
+    gateway_config.service_name = Some("discord".into());
+
+    let gateway = CodexGateway::spawn(gateway_config).await?;
     let handler = Handler {
         gateway: Arc::new(gateway),
         visibility: Arc::new(config.visibility),
@@ -140,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 struct Handler {
-    gateway: Arc<CodexGateway>,
+    gateway: Arc<CodexGateway<ChannelId>>,
     visibility: Arc<VisibilityConfig>,
 }
 
@@ -162,7 +161,9 @@ impl EventHandler for Handler {
             return;
         }
 
-        if let Err(err) = handle_codex_command(&ctx, &command, Arc::clone(&self.gateway)).await {
+        if let Err(err) =
+            handle_codex_command(&ctx, &command, Arc::clone(&self.gateway), output(&ctx)).await
+        {
             error!(?err, "command failed");
             let _ = respond_ephemeral(&ctx, &command, format!("Codex error: {err:#}")).await;
         }
@@ -184,7 +185,7 @@ impl EventHandler for Handler {
 
         if let Err(err) = self
             .gateway
-            .enqueue_turn(ctx, msg.channel_id, prompt, true)
+            .enqueue_turn(msg.channel_id, prompt, true, output(&ctx))
             .await
         {
             error!(?err, "automatic message handling failed");
@@ -359,7 +360,8 @@ fn commands() -> Vec<CreateCommand> {
 async fn handle_codex_command(
     ctx: &Context,
     command: &CommandInteraction,
-    gateway: Arc<CodexGateway>,
+    gateway: Arc<CodexGateway<ChannelId>>,
+    output: Arc<DiscordOutput>,
 ) -> anyhow::Result<()> {
     let Some(sub) = command.data.options.first() else {
         return respond_ephemeral(ctx, command, "Missing subcommand").await;
@@ -370,33 +372,33 @@ async fn handle_codex_command(
         "ask" => {
             let prompt = sub_string(command, "prompt")?;
             let status = gateway
-                .enqueue_turn(ctx.clone(), channel_id, prompt, false)
+                .enqueue_turn(channel_id, prompt, false, output)
                 .await?;
             respond_ephemeral(ctx, command, status).await?;
         }
         "steer" => {
             let message = sub_string(command, "message")?;
             let status = gateway
-                .enqueue_turn(ctx.clone(), channel_id, message, true)
+                .enqueue_turn(channel_id, message, true, output)
                 .await?;
             respond_ephemeral(ctx, command, status).await?;
         }
         "queue" => {
-            respond_ephemeral(ctx, command, gateway.queue_status(channel_id).await).await?;
+            respond_ephemeral(ctx, command, gateway.queue_status(&channel_id).await).await?;
         }
         "model" => {
             let content = if let Some(model) = sub_string_opt(command, "name") {
                 gateway.set_model(channel_id, model).await
             } else {
-                gateway.model_status(channel_id).await
+                gateway.model_status(&channel_id).await
             };
             respond_ephemeral(ctx, command, content).await?;
         }
         "effort" => {
             let content = if let Some(level) = sub_string_opt(command, "level") {
-                gateway.set_effort(channel_id, &level).await?
+                gateway.set_effort(channel_id, parse_effort(&level)?).await
             } else {
-                gateway.effort_status(channel_id).await
+                gateway.effort_status(&channel_id).await
             };
             respond_ephemeral(ctx, command, content).await?;
         }
@@ -405,7 +407,7 @@ async fn handle_codex_command(
             respond_ephemeral(ctx, command, models).await?;
         }
         "status" => {
-            let status = gateway.status(channel_id).await?;
+            let status = gateway.status(&channel_id).await?;
             respond_ephemeral(ctx, command, status).await?;
         }
         "goal" => {
@@ -419,7 +421,7 @@ async fn handle_codex_command(
                 ctx,
                 command,
                 gateway
-                    .set_goal_status(channel_id, ThreadGoalStatus::Paused)
+                    .set_goal_status(channel_id, GoalStatus::Paused)
                     .await?,
             )
             .await?;
@@ -429,7 +431,7 @@ async fn handle_codex_command(
                 ctx,
                 command,
                 gateway
-                    .set_goal_status(channel_id, ThreadGoalStatus::Active)
+                    .set_goal_status(channel_id, GoalStatus::Active)
                     .await?,
             )
             .await?;
@@ -440,11 +442,13 @@ async fn handle_codex_command(
         "session" => {
             let action = sub_string_opt(command, "action").unwrap_or_else(|| "show".into());
             let thread_id = sub_string_opt(command, "thread_id");
-            let content = gateway.session(channel_id, &action, thread_id).await?;
+            let content = gateway
+                .session(channel_id, parse_session_action(&action)?, thread_id)
+                .await?;
             respond_ephemeral(ctx, command, content).await?;
         }
         "interrupt" => {
-            respond_ephemeral(ctx, command, gateway.interrupt(channel_id).await?).await?;
+            respond_ephemeral(ctx, command, gateway.interrupt(&channel_id).await?).await?;
         }
         _ => respond_ephemeral(ctx, command, "Unknown subcommand").await?,
     }
@@ -497,625 +501,32 @@ fn sub_i64_opt(command: &CommandInteraction, name: &str) -> Option<i64> {
         .and_then(|option| option.value.as_i64())
 }
 
-struct CodexGateway {
-    server: Arc<AppServer>,
-    sessions: Arc<Mutex<HashMap<ChannelId, SessionState>>>,
-    default_model: String,
-    default_cwd: Option<String>,
-    next_request_id: AtomicI64,
-    tx: mpsc::Sender<WorkItem>,
+#[derive(Debug)]
+struct DiscordOutput {
+    http: Arc<Http>,
 }
 
-#[derive(Clone)]
-struct SessionState {
-    thread_id: Option<String>,
-    model: String,
-    effort: Option<ReasoningEffort>,
-    active_turn_id: Option<String>,
-    queued: VecDeque<QueuedTurn>,
-}
-
-#[derive(Clone)]
-struct QueuedTurn {
-    prompt: String,
-}
-
-struct WorkItem {
-    ctx: Context,
-    channel_id: ChannelId,
-}
-
-impl CodexGateway {
-    async fn spawn(
-        codex_bin: String,
-        default_model: String,
-        default_cwd: Option<String>,
-        inherit_stderr: bool,
-    ) -> anyhow::Result<Self> {
-        let mut server = AppServer::spawn(AppServerConfig {
-            codex_bin,
-            server_args: vec!["app-server".into()],
-            inherit_stderr,
-        })
-        .await?;
-        server
-            .initialize(AppClientInfo {
-                name: "codex_discord_gateway".into(),
-                title: Some("Codex Discord Gateway".into()),
-                version: env!("CARGO_PKG_VERSION").into(),
-            })
-            .await?;
-
-        let (tx, rx) = mpsc::channel(128);
-        let gateway = Self {
-            server: Arc::new(server),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            default_model,
-            default_cwd,
-            next_request_id: AtomicI64::new(10_000),
-            tx,
-        };
-        gateway.start_worker(rx);
-        Ok(gateway)
-    }
-
-    fn start_worker(&self, mut rx: mpsc::Receiver<WorkItem>) {
-        let server = Arc::clone(&self.server);
-        let sessions = self.sessions.clone();
-        let default_model = self.default_model.clone();
-        let default_cwd = self.default_cwd.clone();
-
-        tokio::spawn(async move {
-            while let Some(item) = rx.recv().await {
-                loop {
-                    let next = {
-                        let mut guard = sessions.lock().await;
-                        let session = guard
-                            .entry(item.channel_id)
-                            .or_insert_with(|| SessionState::new(default_model.clone()));
-                        if session.active_turn_id.is_some() {
-                            None
-                        } else {
-                            session.queued.pop_front()
-                        }
-                    };
-
-                    let Some(turn) = next else {
-                        break;
-                    };
-
-                    if let Err(err) = run_turn(
-                        &server,
-                        &sessions,
-                        &default_model,
-                        default_cwd.as_deref(),
-                        item.ctx.clone(),
-                        item.channel_id,
-                        turn,
-                    )
-                    .await
-                    {
-                        error!(?err, "turn failed");
-                        let _ = item
-                            .channel_id
-                            .say(&item.ctx.http, format!("Codex turn failed: {err:#}"))
-                            .await;
-                    }
-                }
-            }
-        });
-    }
-
-    async fn enqueue_turn(
-        &self,
-        ctx: Context,
-        channel_id: ChannelId,
-        prompt: String,
-        steer: bool,
-    ) -> anyhow::Result<String> {
-        if steer {
-            let snapshot = self.session_snapshot(channel_id).await;
-            if let (Some(thread_id), Some(turn_id)) =
-                (snapshot.thread_id.clone(), snapshot.active_turn_id.clone())
-            {
-                let _: TurnSteerResponse = self
-                    .call(|id| ClientRequest::TurnSteer {
-                        id,
-                        params: TurnSteerParams {
-                            client_user_message_id: None,
-                            expected_turn_id: turn_id,
-                            input: vec![UserInput::Text {
-                                text: prompt,
-                                text_elements: vec![],
-                            }],
-                            thread_id,
-                        },
-                    })
+impl TurnOutput<ChannelId> for DiscordOutput {
+    fn send<'a>(
+        &'a self,
+        channel_id: &'a ChannelId,
+        text: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            for chunk in discord_chunks(text, DISCORD_LIMIT) {
+                channel_id
+                    .send_message(&self.http, CreateMessage::new().content(chunk))
                     .await?;
-                return Ok("Done.".into());
             }
-        }
-
-        {
-            let mut guard = self.sessions.lock().await;
-            let session = guard
-                .entry(channel_id)
-                .or_insert_with(|| SessionState::new(self.default_model.clone()));
-            session.queued.push_back(QueuedTurn { prompt });
-        }
-
-        self.tx.send(WorkItem { ctx, channel_id }).await?;
-        Ok("Done.".into())
-    }
-
-    async fn queue_status(&self, channel_id: ChannelId) -> String {
-        let guard = self.sessions.lock().await;
-        let Some(session) = guard.get(&channel_id) else {
-            return "No session for this channel yet.".into();
-        };
-        let active = session
-            .active_turn_id
-            .as_deref()
-            .unwrap_or("no active turn");
-        format!("Active: {active}\nQueued turns: {}", session.queued.len())
-    }
-
-    async fn model_status(&self, channel_id: ChannelId) -> String {
-        let session = self.session_snapshot(channel_id).await;
-        format!("Current model: `{}`", session.model)
-    }
-
-    async fn set_model(&self, channel_id: ChannelId, model: String) -> String {
-        let mut guard = self.sessions.lock().await;
-        let session = guard
-            .entry(channel_id)
-            .or_insert_with(|| SessionState::new(self.default_model.clone()));
-        session.model = model.clone();
-        format!("Model set to `{model}`. It will apply to the next turn.")
-    }
-
-    async fn effort_status(&self, channel_id: ChannelId) -> String {
-        let session = self.session_snapshot(channel_id).await;
-        match session.effort {
-            Some(effort) => format!("Current reasoning effort: `{effort}`"),
-            None => "Current reasoning effort: Codex default".into(),
-        }
-    }
-
-    async fn set_effort(&self, channel_id: ChannelId, level: &str) -> anyhow::Result<String> {
-        let effort = parse_effort(level)?;
-        let mut guard = self.sessions.lock().await;
-        let session = guard
-            .entry(channel_id)
-            .or_insert_with(|| SessionState::new(self.default_model.clone()));
-        session.effort = effort;
-        Ok(match effort {
-            Some(value) => format!("Reasoning effort set to `{value}`."),
-            None => "Reasoning effort cleared; Codex default will be used.".into(),
+            Ok(())
         })
     }
-
-    async fn list_models(&self) -> anyhow::Result<String> {
-        let response: ModelListResponse = self
-            .call(|id| ClientRequest::ModelList {
-                id,
-                params: ModelListParams {
-                    include_hidden: Some(false),
-                    limit: Some(25),
-                    ..Default::default()
-                },
-            })
-            .await?;
-        let mut out = String::from("Available models:\n");
-        for model in response.data.iter().take(25) {
-            let default = if model.is_default { " default" } else { "" };
-            out.push_str(&format!(
-                "- `{}` ({}){}\n",
-                model.model, model.display_name, default
-            ));
-        }
-        if response.next_cursor.is_some() {
-            out.push_str("\nMore models exist; increase this command if needed.");
-        }
-        Ok(out)
-    }
-
-    async fn status(&self, channel_id: ChannelId) -> anyhow::Result<String> {
-        let session = self.session_snapshot(channel_id).await;
-        let limits: GetAccountRateLimitsResponse = self
-            .call(|id| ClientRequest::AccountRateLimitsRead { id, params: () })
-            .await?;
-
-        let mut out = String::new();
-        out.push_str(&format!(
-            "Thread: `{}`\nModel: `{}`\nEffort: `{}`\n",
-            session.thread_id.as_deref().unwrap_or("none"),
-            session.model,
-            session
-                .effort
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "Codex default".into())
-        ));
-        out.push_str(&format_rate_limits(&limits));
-        Ok(out)
-    }
-
-    async fn goal(
-        &self,
-        channel_id: ChannelId,
-        objective: Option<String>,
-        budget: Option<i64>,
-    ) -> anyhow::Result<String> {
-        let thread_id = self.ensure_thread(channel_id).await?;
-        if let Some(objective) = objective {
-            let response: ThreadGoalSetResponse = self
-                .call(|id| ClientRequest::ThreadGoalSet {
-                    id,
-                    params: ThreadGoalSetParams {
-                        thread_id: thread_id.clone(),
-                        objective: Some(objective),
-                        token_budget: budget,
-                        status: Some(ThreadGoalStatus::Active),
-                    },
-                })
-                .await?;
-            return Ok(format_goal(Some(&response.goal)));
-        }
-
-        let response: ThreadGoalGetResponse = self
-            .call(|id| ClientRequest::ThreadGoalGet {
-                id,
-                params: ThreadGoalGetParams {
-                    thread_id: thread_id.clone(),
-                },
-            })
-            .await?;
-        Ok(format_goal(response.goal.as_ref()))
-    }
-
-    async fn set_goal_status(
-        &self,
-        channel_id: ChannelId,
-        status: ThreadGoalStatus,
-    ) -> anyhow::Result<String> {
-        let thread_id = self.ensure_thread(channel_id).await?;
-        let response: ThreadGoalSetResponse = self
-            .call(|id| ClientRequest::ThreadGoalSet {
-                id,
-                params: ThreadGoalSetParams {
-                    thread_id: thread_id.clone(),
-                    objective: None,
-                    token_budget: None,
-                    status: Some(status),
-                },
-            })
-            .await?;
-        Ok(format_goal(Some(&response.goal)))
-    }
-
-    async fn clear_goal(&self, channel_id: ChannelId) -> anyhow::Result<String> {
-        let thread_id = self.ensure_thread(channel_id).await?;
-        let response: ThreadGoalClearResponse = self
-            .call(|id| ClientRequest::ThreadGoalClear {
-                id,
-                params: ThreadGoalClearParams {
-                    thread_id: thread_id.clone(),
-                },
-            })
-            .await?;
-        Ok(if response.cleared {
-            "Goal cleared.".into()
-        } else {
-            "No goal was set.".into()
-        })
-    }
-
-    async fn session(
-        &self,
-        channel_id: ChannelId,
-        action: &str,
-        thread_id: Option<String>,
-    ) -> anyhow::Result<String> {
-        match action {
-            "show" => {
-                let session = self.session_snapshot(channel_id).await;
-                Ok(format!(
-                    "Thread: `{}`\nModel: `{}`\nEffort: `{}`",
-                    session.thread_id.as_deref().unwrap_or("none"),
-                    session.model,
-                    session
-                        .effort
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "Codex default".into())
-                ))
-            }
-            "new" => {
-                let thread = self.start_thread(channel_id).await?;
-                Ok(format!("Started new thread `{}`.", thread.thread_id))
-            }
-            "list" => {
-                let response: ThreadListResponse = self
-                    .call(|id| ClientRequest::ThreadList {
-                        id,
-                        params: ThreadListParams {
-                            limit: Some(10),
-                            ..Default::default()
-                        },
-                    })
-                    .await?;
-                let mut out = String::from("Recent threads:\n");
-                for thread in response.data {
-                    out.push_str(&format!(
-                        "- `{}` {} ({})\n",
-                        thread.id,
-                        thread.name.unwrap_or(thread.preview),
-                        fmt_ts(thread.updated_at)
-                    ));
-                }
-                Ok(out)
-            }
-            "switch" => {
-                let thread_id = thread_id.ok_or_else(|| anyhow!("thread_id is required"))?;
-                let snapshot = self.session_snapshot(channel_id).await;
-                let response: ThreadResumeResponse = self
-                    .call(|id| ClientRequest::ThreadResume {
-                        id,
-                        params: ThreadResumeParams {
-                            thread_id: thread_id.clone(),
-                            model: Some(snapshot.model.clone()),
-                            cwd: self.default_cwd.clone(),
-                            ..empty_thread_resume_params()
-                        },
-                    })
-                    .await?;
-                let mut guard = self.sessions.lock().await;
-                let session = guard
-                    .entry(channel_id)
-                    .or_insert_with(|| SessionState::new(self.default_model.clone()));
-                session.thread_id = Some(response.thread.id.clone());
-                Ok(format!("Switched to thread `{}`.", response.thread.id))
-            }
-            other => Err(anyhow!("unknown session action `{other}`")),
-        }
-    }
-
-    async fn interrupt(&self, channel_id: ChannelId) -> anyhow::Result<String> {
-        let session = self.session_snapshot(channel_id).await;
-        let thread_id = session
-            .thread_id
-            .ok_or_else(|| anyhow!("no active thread for this channel"))?;
-        let turn_id = session
-            .active_turn_id
-            .ok_or_else(|| anyhow!("no active turn for this channel"))?;
-        let _: TurnInterruptResponse = self
-            .call(|id| ClientRequest::TurnInterrupt {
-                id,
-                params: TurnInterruptParams { thread_id, turn_id },
-            })
-            .await?;
-        Ok("Interrupt requested.".into())
-    }
-
-    async fn ensure_thread(&self, channel_id: ChannelId) -> anyhow::Result<String> {
-        if let Some(thread_id) = self.session_snapshot(channel_id).await.thread_id {
-            return Ok(thread_id);
-        }
-        Ok(self.start_thread(channel_id).await?.thread_id)
-    }
-
-    async fn start_thread(&self, channel_id: ChannelId) -> anyhow::Result<ThreadHandle> {
-        let snapshot = self.session_snapshot(channel_id).await;
-        let thread = {
-            self.server
-                .thread_start(ThreadStartParams {
-                    model: Some(snapshot.model),
-                    cwd: self.default_cwd.clone(),
-                    service_name: Some("discord".into()),
-                    ..Default::default()
-                })
-                .await?
-        };
-        let mut guard = self.sessions.lock().await;
-        let session = guard
-            .entry(channel_id)
-            .or_insert_with(|| SessionState::new(self.default_model.clone()));
-        session.thread_id = Some(thread.thread_id.clone());
-        Ok(thread)
-    }
-
-    async fn call<R, F>(&self, build: F) -> anyhow::Result<R>
-    where
-        R: for<'de> serde::Deserialize<'de>,
-        F: FnOnce(RequestId) -> ClientRequest,
-    {
-        let id = RequestId::Int64(self.next_request_id.fetch_add(1, Ordering::Relaxed));
-        self.server.call(build(id)).await.map_err(Into::into)
-    }
-
-    async fn session_snapshot(&self, channel_id: ChannelId) -> SessionState {
-        let mut guard = self.sessions.lock().await;
-        guard
-            .entry(channel_id)
-            .or_insert_with(|| SessionState::new(self.default_model.clone()))
-            .clone()
-    }
 }
 
-async fn run_turn(
-    server: &Arc<AppServer>,
-    sessions: &Mutex<HashMap<ChannelId, SessionState>>,
-    default_model: &str,
-    default_cwd: Option<&str>,
-    ctx: Context,
-    channel_id: ChannelId,
-    queued: QueuedTurn,
-) -> anyhow::Result<()> {
-    let snapshot = {
-        let mut guard = sessions.lock().await;
-        guard
-            .entry(channel_id)
-            .or_insert_with(|| SessionState::new(default_model.to_string()))
-            .clone()
-    };
-
-    let thread_id = match snapshot.thread_id {
-        Some(thread_id) => thread_id,
-        None => {
-            let thread = {
-                server
-                    .thread_start(ThreadStartParams {
-                        model: Some(snapshot.model.clone()),
-                        cwd: default_cwd.map(str::to_string),
-                        service_name: Some("discord".into()),
-                        ..Default::default()
-                    })
-                    .await?
-            };
-            let mut guard = sessions.lock().await;
-            let session = guard
-                .entry(channel_id)
-                .or_insert_with(|| SessionState::new(default_model.to_string()));
-            session.thread_id = Some(thread.thread_id.clone());
-            thread.thread_id
-        }
-    };
-
-    let start: TurnStartResponse = {
-        server
-            .call(ClientRequest::TurnStart {
-                id: RequestId::String(format!("turn-start-{channel_id}-{thread_id}")),
-                params: TurnStartParams {
-                    thread_id: thread_id.clone(),
-                    input: vec![UserInput::Text {
-                        text: queued.prompt,
-                        text_elements: vec![],
-                    }],
-                    model: Some(snapshot.model),
-                    effort: snapshot.effort,
-                    cwd: default_cwd.map(str::to_string),
-                    ..empty_turn_start_params()
-                },
-            })
-            .await?
-    };
-    let turn_id = start.turn.id.clone();
-
-    {
-        let mut guard = sessions.lock().await;
-        if let Some(session) = guard.get_mut(&channel_id) {
-            session.active_turn_id = Some(turn_id.clone());
-        }
-    }
-
-    let mut sent_agent_items = HashSet::new();
-
-    loop {
-        let incoming = { server.recv().await? };
-
-        let codex_app_server::IncomingMessage::Notification(notification) = incoming else {
-            continue;
-        };
-
-        match *notification {
-            ServerNotification::ItemCompleted(item)
-                if item.thread_id == thread_id && item.turn_id == turn_id =>
-            {
-                if let Some((id, text)) = agent_item_text(&item.item)
-                    && !text.trim().is_empty()
-                    && sent_agent_items.insert(id.to_string())
-                {
-                    send_discord_text(&ctx, channel_id, text).await?;
-                }
-            }
-            ServerNotification::TurnCompleted(note)
-                if note.thread_id == thread_id && note.turn.id == turn_id =>
-            {
-                for item in &note.turn.items {
-                    if let Some((id, text)) = agent_item_text(item)
-                        && !text.trim().is_empty()
-                        && sent_agent_items.insert(id.to_string())
-                    {
-                        send_discord_text(&ctx, channel_id, text).await?;
-                    }
-                }
-                {
-                    let mut guard = sessions.lock().await;
-                    if let Some(session) = guard.get_mut(&channel_id) {
-                        session.active_turn_id = None;
-                    }
-                }
-                break;
-            }
-            ServerNotification::Error(err)
-                if err.thread_id == thread_id && err.turn_id == turn_id =>
-            {
-                let mut guard = sessions.lock().await;
-                if let Some(session) = guard.get_mut(&channel_id) {
-                    session.active_turn_id = None;
-                }
-                return Err(anyhow!("{:?}", err.error));
-            }
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
-
-async fn send_discord_text(ctx: &Context, channel_id: ChannelId, text: &str) -> anyhow::Result<()> {
-    for chunk in discord_chunks(text, DISCORD_LIMIT) {
-        channel_id
-            .send_message(&ctx.http, CreateMessage::new().content(chunk))
-            .await?;
-    }
-    Ok(())
-}
-
-impl SessionState {
-    fn new(model: String) -> Self {
-        Self {
-            thread_id: None,
-            model,
-            effort: None,
-            active_turn_id: None,
-            queued: VecDeque::new(),
-        }
-    }
-}
-
-fn empty_turn_start_params() -> TurnStartParams {
-    TurnStartParams {
-        approval_policy: None,
-        approvals_reviewer: None,
-        client_user_message_id: None,
-        cwd: None,
-        effort: None,
-        input: vec![],
-        model: None,
-        output_schema: None,
-        personality: None,
-        sandbox_policy: None,
-        service_tier: None,
-        summary: None,
-        thread_id: String::new(),
-    }
-}
-
-fn empty_thread_resume_params() -> ThreadResumeParams {
-    ThreadResumeParams {
-        approval_policy: None,
-        approvals_reviewer: None,
-        base_instructions: None,
-        config: None,
-        cwd: None,
-        developer_instructions: None,
-        model: None,
-        model_provider: None,
-        personality: None,
-        sandbox: None,
-        service_tier: None,
-        thread_id: String::new(),
-    }
+fn output(ctx: &Context) -> Arc<DiscordOutput> {
+    Arc::new(DiscordOutput {
+        http: Arc::clone(&ctx.http),
+    })
 }
 
 fn parse_effort(value: &str) -> anyhow::Result<Option<ReasoningEffort>> {
@@ -1131,74 +542,13 @@ fn parse_effort(value: &str) -> anyhow::Result<Option<ReasoningEffort>> {
     }
 }
 
-fn format_goal(goal: Option<&codex_app_server_protocol::ThreadGoal>) -> String {
-    let Some(goal) = goal else {
-        return "No goal set.".into();
-    };
-    format!(
-        "Goal: {}\nStatus: `{}`\nTokens: {}{}\nTime used: {}s",
-        goal.objective,
-        goal.status,
-        goal.tokens_used,
-        goal.token_budget
-            .map(|budget| format!(" / {budget}"))
-            .unwrap_or_default(),
-        goal.time_used_seconds
-    )
-}
-
-fn format_rate_limits(response: &GetAccountRateLimitsResponse) -> String {
-    let mut out = String::from("Rate limits\n");
-    let snapshots: Vec<_> = response
-        .rate_limits_by_limit_id
-        .as_ref()
-        .map(|map| map.values().collect())
-        .unwrap_or_else(|| vec![&response.rate_limits]);
-
-    for snapshot in snapshots {
-        let name = snapshot
-            .limit_name
-            .as_deref()
-            .or(snapshot.limit_id.as_deref())
-            .unwrap_or("default");
-        out.push_str(&format!("- **{name}**"));
-        if let Some(primary) = &snapshot.primary {
-            out.push_str(&format!(
-                ": primary {} remaining, resets {}",
-                remaining_percent(primary.used_percent),
-                discord_relative_ts(primary.resets_at)
-            ));
-        }
-        if let Some(secondary) = &snapshot.secondary {
-            out.push_str(&format!(
-                "; secondary {} remaining, resets {}",
-                remaining_percent(secondary.used_percent),
-                discord_relative_ts(secondary.resets_at)
-            ));
-        }
-        if snapshot.primary.is_none() && snapshot.secondary.is_none() {
-            out.push_str(" no window data");
-        }
-        out.push('\n');
-    }
-    out
-}
-
-fn remaining_percent(used_percent: i32) -> String {
-    format!("{}%", (100 - used_percent).clamp(0, 100))
-}
-
-fn discord_relative_ts(ts: Option<i64>) -> String {
-    ts.map(|ts| format!("<t:{ts}:R>"))
-        .unwrap_or_else(|| "unknown".into())
-}
-
-fn agent_item_text(item: &codex_app_server_protocol::ThreadItem) -> Option<(&str, &str)> {
-    match item {
-        codex_app_server_protocol::ThreadItem::AgentMessage { id, text, .. } => {
-            Some((id.as_str(), text.as_str()))
-        }
-        _ => None,
+fn parse_session_action(value: &str) -> anyhow::Result<SessionAction> {
+    match value.to_ascii_lowercase().as_str() {
+        "show" => Ok(SessionAction::Show),
+        "new" => Ok(SessionAction::New),
+        "list" => Ok(SessionAction::List),
+        "switch" => Ok(SessionAction::Switch),
+        other => Err(anyhow!("unknown session action `{other}`")),
     }
 }
 
@@ -1230,12 +580,6 @@ fn char_boundary_at_or_before(text: &str, max: usize) -> usize {
         boundary -= 1;
     }
     boundary.max(1)
-}
-
-fn fmt_ts(ts: i64) -> String {
-    DateTime::<Utc>::from_timestamp(ts, 0)
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_else(|| "unknown".into())
 }
 
 fn truncate(mut value: String, max: usize) -> String {

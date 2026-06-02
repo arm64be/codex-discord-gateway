@@ -1,7 +1,8 @@
 # Codex Discord Gateway
 
-Rust Discord bot that drives a local `codex app-server` process through
-[`arm64be/codex-rs`](https://github.com/arm64be/codex-rs).
+Rust Discord bot for Codex. Gateway state, turn queues, sessions, goals, and
+Codex app-server interaction are handled by
+[`arm64be/codex-gateway-core`](https://github.com/arm64be/codex-gateway-core).
 
 ## Requirements
 
@@ -87,3 +88,7 @@ Automatic message visibility is opt-in. The bot only reads normal message
 content from users and channels listed in `[visibility]`. In `mention` mode the
 message must mention the bot; in `always` mode any message from an allowed user
 in that channel is sent to Codex. Allowed DMs never require a mention.
+
+## License
+
+Licensed under either of Apache License, Version 2.0 or MIT license, at your option.

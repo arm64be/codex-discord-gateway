@@ -164,17 +164,28 @@ name = "codex-discord-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
- "codex-app-server",
- "codex-app-server-protocol",
+ "codex-gateway-core",
  "serde",
- "serde_json",
  "serenity",
- "thiserror 2.0.18",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "codex-gateway-core"
+version = "0.1.0"
+source = "git+https://github.com/arm64be/codex-gateway-core.git#e38447f1e13953dd81f8805a3bc4cf19453a6e38"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codex-app-server",
+ "codex-app-server-protocol",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
