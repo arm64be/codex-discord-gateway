@@ -1,0 +1,32 @@
+discord_token = "your-discord-bot-token"
+default_model = "gpt-5.4-mini"
+
+# Optional:
+# codex_bin = "codex"
+# cwd = "/path/to/workspace"
+# inherit_stderr = false
+
+[visibility]
+# Users who may DM the bot. DMs never require a mention.
+dm_allow_users = [
+  111111111111111111,
+  444444444444444444,
+]
+
+# Alice and Bob are visible in this channel only when they mention the bot.
+[[visibility.channels]]
+id = 555555555555555555
+mode = "mention"
+users = [
+  111111111111111111,
+  222222222222222222,
+]
+
+# Bob and David are visible in this channel without mentioning the bot.
+[[visibility.channels]]
+id = 666666666666666666
+mode = "always"
+users = [
+  222222222222222222,
+  444444444444444444,
+]
